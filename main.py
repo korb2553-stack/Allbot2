@@ -5,6 +5,8 @@ Discord Bot (discord.py 2.x)
  - /ล็อค /ปลด   ปิด-เปิดการเชื่อมต่อห้อง + Snapshot รายชื่อคนในห้อง
  - !bl <ID> / !unbl <ID> (หรือ /bl /unbl)  Blacklist: พิมพ์แล้วบอทเตือนและลบข้อความ
  - !ขัง <ID> / !ปล่อย <ID>  ขังไว้ในห้องที่ลงล่าสุด (enforce เมื่อลงห้อง)
+ - !ไมค์แดง / !ปลดไมค์ / !ตัดหมด (หรือ /ไมค์แดง /ปลดไมค์ /ตัดหมด)
+     จัดการทุกคนในห้องเสียงที่คุณอยู่ทีเดียว (ข้ามคนมียศ) + ส่งรายงานผล
 
 ติดตั้ง:  pip install -U discord.py
 รัน:      วางโทเคนในไฟล์ token.txt (หรือตั้ง DISCORD_TOKEN) แล้ว python main.py
@@ -44,6 +46,8 @@ def _read_token() -> str:
 TOKEN = _read_token()
 PREFIX_RE = re.compile(r"^!(ขัง|ปล่อย)\s+<?@?!?(\d{15,20})>?")
 BL_RE = re.compile(r"^!(bl|unbl)\s+<?@?!?(\d{15,20})>?", re.IGNORECASE)  # พิมพ์เล็ก/ใหญ่ได้
+BULK_RE = re.compile(r"^!(ไมค์แดง|ปลดไมค์|ตัดหมด)(?:\s|$)")
+BULK_ACTIONS = {"ไมค์แดง": "mute", "ปลดไมค์": "unmute", "ตัดหมด": "cut"}
 
 
 # ---------- เก็บข้อมูลลงไฟล์ ----------
@@ -71,6 +75,7 @@ def save():
 data = load()
 bl_active = {}   # (guild_id, user_id) -> กำลังแจ้งเตือนอยู่ (กันบอทตอบรัว)
 last_voice = {}  # (guild_id, user_id) -> ห้องเสียงล่าสุดที่บอทเห็นว่าเข้า
+self_edits = {}  # (guild_id, user_id) -> เวลาที่บอทสั่งเปิด/ปิดไมค์เอง (ให้ handler ข้ามการค้น Audit Log)
 
 
 def g(guild_id: int) -> dict:
@@ -171,6 +176,11 @@ async def send_warning(member: discord.Member, executor: discord.abc.User, chann
         pass
 
 
+def _is_self_edit(member: discord.Member) -> bool:
+    t = self_edits.pop((member.guild.id, member.id), None)
+    return t is not None and time.monotonic() - t < 30
+
+
 async def on_voice_state_update(member, before, after):
     gd = g(member.guild.id)
     muted = gd["muted"]
@@ -199,6 +209,9 @@ async def on_voice_state_update(member, before, after):
         return
 
     if before.mute == after.mute or after.channel is None:
+        return
+
+    if _is_self_edit(member):  # บอทสั่งเอง (ไมค์แดง/ปลดไมค์) ไม่ต้องหาผู้สั่ง
         return
 
     executor = await find_executor(member.guild, member, after.mute)
@@ -414,6 +427,153 @@ async def handle_blacklisted(msg: discord.Message):
     await _try_delete(warn)  # ลบข้อความแจ้งเตือนของบอทหลัง 10 วิ ให้แชทไม่รก
 
 
+# ---------- ไมค์แดง / ปลดไมค์ / ตัดหมด (ทั้งห้อง) ----------
+LIST_LIMIT = 20  # แสดงรายชื่อในรายงานสูงสุดกี่คน (กัน Embed ยาวเกิน)
+
+
+def _fmt_list(members, with_mention: bool) -> str:
+    lines = []
+    for m in members[:LIST_LIMIT]:
+        name = discord.utils.escape_markdown(m.display_name)
+        lines.append(f"• <@{m.id}> | {name} | {m.id}" if with_mention else f"• {name}")
+    if len(members) > LIST_LIMIT:
+        lines.append(f"... และอีก {len(members) - LIST_LIMIT} คน")
+    return "\n".join(lines)
+
+
+async def _run_all(members, action):
+    """สั่งทำพร้อมกันทีละไม่เกิน 5 คน คืน (สำเร็จ, ไม่สำเร็จ)"""
+    sem = asyncio.Semaphore(5)
+
+    async def one(m):
+        async with sem:
+            try:
+                await action(m)
+                return m, True
+            except discord.HTTPException:
+                return m, False
+
+    results = await asyncio.gather(*(one(m) for m in members))
+    return [m for m, ok in results if ok], [m for m, ok in results if not ok]
+
+
+async def bulk_voice(guild: discord.Guild, channel, action: str, actor) -> dict:
+    """action: mute | unmute | cut  คืน kwargs สำหรับส่งข้อความ (content หรือ embed)"""
+    t0 = time.perf_counter()
+    gd = g(guild.id)
+    members = [m for m in channel.members]
+    exempt, already = [], []
+
+    if action == "unmute":
+        targets = [m for m in members if m.voice and m.voice.mute]
+    else:
+        exempt = [m for m in members if m.bot or is_staff(m)]  # ข้ามคนมียศ/ทีมงาน/บอท
+        rest = [m for m in members if m not in exempt]
+        if action == "mute":
+            already = [m for m in rest if m.voice and m.voice.mute]
+            targets = [m for m in rest if m not in already]
+        else:
+            targets = rest
+
+    async def do_mute(m, value):
+        key = (guild.id, m.id)
+        self_edits[key] = time.monotonic()
+        try:
+            await m.edit(mute=value, reason=f"{'ไมค์แดง' if value else 'ปลดไมค์'} โดย {actor}")
+        except discord.HTTPException:
+            self_edits.pop(key, None)
+            raise
+
+    if action == "mute":
+        ok, bad = await _run_all(targets, lambda m: do_mute(m, True))
+        for m in ok + already:  # ล็อคไว้ด้วย: ปลดได้เฉพาะยศที่กำหนด + บังคับซ้ำเมื่อลงห้อง
+            if m.id not in gd["muted"]:
+                gd["muted"].append(m.id)
+    elif action == "unmute":
+        ok, bad = await _run_all(targets, lambda m: do_mute(m, False))
+        for m in ok:
+            if m.id in gd["muted"]:
+                gd["muted"].remove(m.id)
+    else:
+        ok, bad = await _run_all(
+            targets, lambda m: m.move_to(None, reason=f"ตัดหมด โดย {actor}")
+        )
+    save()
+
+    took = time.perf_counter() - t0
+
+    if action == "cut":
+        text = (
+            f"✂️ ตัดการเชื่อมต่อในห้อง {channel.mention} เสร็จแล้ว!\n"
+            f"• ตัดแล้ว: {len(ok)} คน\n"
+            f"• ข้าม (มี role): {len(exempt)} คน\n"
+            f"• ไม่สำเร็จ: {len(bad)} คน\n"
+            f"⚡ เวลาที่ใช้: {took:.2f} วินาที"
+        )
+        if bad:
+            text += "\n💡 บอทต้องมียศสูงกว่าคนเหล่านั้น และมีสิทธิ์ Move Members"
+        return {"content": text}
+
+    if action == "mute":
+        title, color, word = "🔇 รายงาน Server Mute", 0xE74C3C, "Mute"
+    else:
+        title, color, word = "🔊 รายงาน Server Unmute", 0x2ECC71, "Unmute"
+    parts = [f"**{channel.name}**\n"]
+    if ok or not (already or exempt or bad):
+        parts.append(f"✅ **{word} สำเร็จ ({len(ok)} คน)**\n{_fmt_list(ok, True)}".rstrip())
+    if already:
+        parts.append(f"⏭️ **ข้ามคนถูก Mute อยู่แล้ว**\n{len(already)} คน")
+    if exempt:
+        parts.append(f"🛡️ **ข้าม (มี role) ({len(exempt)} คน)**\n{_fmt_list(exempt, False)}")
+    if bad:
+        parts.append(
+            f"❌ **ไม่สำเร็จ**\n{len(bad)} คน\n"
+            f"💡 บอทต้องมียศสูงกว่าคนเหล่านั้น และมีสิทธิ์ Mute Members"
+        )
+    embed = discord.Embed(
+        title=f"{title}:",
+        description="\n".join(parts),
+        color=color,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.set_footer(text=f"⚡ เวลาที่ใช้: {took:.2f} วินาที")
+    return {"embed": embed}
+
+
+async def bulk_slash(i: discord.Interaction, channel, action: str):
+    if not is_staff(i.user):
+        return await i.response.send_message("⚠️ คุณไม่มียศที่ใช้คำสั่งนี้", ephemeral=True)
+    ch = channel or (i.user.voice.channel if i.user.voice else None)
+    if ch is None:
+        return await i.response.send_message(
+            "⚠️ เข้าห้องเสียงก่อน หรือระบุห้องที่ต้องการ", ephemeral=True
+        )
+    await i.response.defer()
+    kw = await bulk_voice(i.guild, ch, action, i.user)
+    await i.followup.send(allowed_mentions=discord.AllowedMentions.none(), **kw)
+
+
+@app_commands.command(name="ไมค์แดง", description="ปิดไมค์ทุกคนในห้อง (ข้ามคนมียศ) + ล็อคไมค์")
+@app_commands.guild_only()
+@app_commands.describe(channel=ROOM_DESC)
+async def red_mic(i: discord.Interaction, channel: Optional[discord.VoiceChannel] = None):
+    await bulk_slash(i, channel, "mute")
+
+
+@app_commands.command(name="ปลดไมค์", description="ปลดไมค์ทุกคนในห้อง")
+@app_commands.guild_only()
+@app_commands.describe(channel=ROOM_DESC)
+async def free_mic(i: discord.Interaction, channel: Optional[discord.VoiceChannel] = None):
+    await bulk_slash(i, channel, "unmute")
+
+
+@app_commands.command(name="ตัดหมด", description="ตัดการเชื่อมต่อทุกคนในห้อง (ข้ามคนมียศ)")
+@app_commands.guild_only()
+@app_commands.describe(channel=ROOM_DESC)
+async def cut_all(i: discord.Interaction, channel: Optional[discord.VoiceChannel] = None):
+    await bulk_slash(i, channel, "cut")
+
+
 # ---------- ขัง / ปล่อย ----------
 async def handle_message(msg: discord.Message):
     if msg.author.bot or not msg.guild:
@@ -430,6 +590,18 @@ async def handle_message(msg: discord.Message):
         text = bl_toggle(msg.guild, int(bm.group(2)), bm.group(1).lower() == "bl")
         return await msg.reply(
             text, allowed_mentions=discord.AllowedMentions.none(), mention_author=False
+        )
+
+    bk = BULK_RE.match(msg.content)
+    if bk:
+        if not is_staff(msg.author):
+            return await msg.reply("⚠️ คุณไม่มียศที่ใช้คำสั่งนี้", mention_author=False)
+        ch = msg.author.voice.channel if msg.author.voice else None
+        if ch is None:
+            return await msg.reply("⚠️ เข้าห้องเสียงก่อนใช้คำสั่งนี้", mention_author=False)
+        kw = await bulk_voice(msg.guild, ch, BULK_ACTIONS[bk.group(1)], msg.author)
+        return await msg.reply(
+            allowed_mentions=discord.AllowedMentions.none(), mention_author=False, **kw
         )
 
     m = PREFIX_RE.match(msg.content)
@@ -483,6 +655,7 @@ async def on_message(msg: discord.Message):
     consumed = bool(msg.guild) and (
         (msg.author.id in g(msg.guild.id)["blacklist"] and not is_staff(msg.author))
         or BL_RE.match(msg.content)
+        or BULK_RE.match(msg.content)
         or PREFIX_RE.match(msg.content)
     )
     await handle_message(msg)
@@ -609,7 +782,7 @@ async def update_status():
 
 COMMANDS = [
     hide, show, lock, unlock, set_jail, bl_add, bl_remove,
-    roles_group, vmute, vunmute,
+    roles_group, vmute, vunmute, red_mic, free_mic, cut_all,
 ]
 
 
@@ -642,4 +815,3 @@ if __name__ == "__main__":
             print(f"⚠️ ล็อกอินไม่ได้ (429 โดนบล็อกชั่วคราว) รอ {delay // 60} นาทีแล้วลองใหม่ ไม่ต้องกด Start ซ้ำ")
             time.sleep(delay)
             delay = min(delay * 2, 3600)
-
