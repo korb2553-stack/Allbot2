@@ -1,7 +1,9 @@
+import asyncio
 import json
 import os
 import re
 import time
+import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +22,9 @@ DEFAULT = {
     "spam": {"level": "medium"},
     "bots": {"level": "medium"},
     "links": {"level": "medium", "allow": ["tenor.com", "giphy.com"]},
+    # Role Guard: ไวลิสแยกจากไวท์ลิสต์ปกติ
+    #   allow_roles = ยศที่ใส่ให้คนอื่นได้ (บอทไม่ถอด) / keep_roles = ยศเมมเบอร์ที่เก็บไว้ตอนถอดทุกยศ
+    "roleguard": {"enabled": True, "allow_roles": [], "keep_roles": []},
 }
 
 A = discord.AuditLogAction
@@ -173,6 +178,14 @@ def onoff(b):
     return "✅ เปิด" if b else "❌ ปิด"
 
 
+# ชื่อยศที่ถือว่าเป็น "เมมเบอร์" (ใช้เมื่อยังไม่ได้เลือกยศเมมเบอร์เอง) เทียบหลังตัดสัญลักษณ์/เว้นวรรค
+def _norm(text):
+    return "".join(c for c in text.lower() if unicodedata.category(c)[0] in "LMN")
+
+
+MEMBER_KEYS = {_norm(n) for n in ("member", "members", "เมมเบอร์", "สมาชิก")}
+
+
 # ───────────────────────── เมนู (เจ้าของเท่านั้น) ─────────────────────────
 class OwnerView(discord.ui.View):
     def __init__(self, cog):
@@ -238,6 +251,43 @@ class LevelView(OwnerView):
         await i.response.edit_message(embed=self.cog.level_embed(self.mod), view=self)
 
 
+class RoleGuardView(OwnerView):
+    """/antirole = ตั้งไวลิสแยก (ยศที่ใส่ให้คนอื่นได้) + ยศเมมเบอร์ที่เก็บไว้"""
+
+    @discord.ui.select(cls=discord.ui.RoleSelect, min_values=1, max_values=25,
+                       placeholder="✅ ไวลิสแยก: ยศที่ใส่ให้คนอื่นได้ (เลือกซ้ำ = ลบออก)")
+    async def allow_roles(self, i: discord.Interaction, s: discord.ui.RoleSelect):
+        rg = self.cog.cfg["roleguard"]
+        cur = set(rg["allow_roles"])
+        for r in s.values:
+            cur ^= {r.id}
+        rg["allow_roles"] = list(cur)
+        save(self.cog.cfg)
+        await i.response.edit_message(embed=self.cog.roleguard_embed(i.guild), view=self)
+
+    @discord.ui.select(cls=discord.ui.RoleSelect, min_values=1, max_values=25,
+                       placeholder="👤 ยศเมมเบอร์ที่เก็บไว้ (เลือกซ้ำ = ลบออก)")
+    async def keep_roles(self, i: discord.Interaction, s: discord.ui.RoleSelect):
+        rg = self.cog.cfg["roleguard"]
+        cur = set(rg["keep_roles"])
+        for r in s.values:
+            cur ^= {r.id}
+        rg["keep_roles"] = list(cur)
+        save(self.cog.cfg)
+        await i.response.edit_message(embed=self.cog.roleguard_embed(i.guild), view=self)
+
+    @discord.ui.button(label="เปิด/ปิดระบบ", emoji="🔁", style=discord.ButtonStyle.danger)
+    async def toggle(self, i, b):
+        rg = self.cog.cfg["roleguard"]
+        rg["enabled"] = not rg["enabled"]
+        save(self.cog.cfg)
+        await i.response.edit_message(embed=self.cog.roleguard_embed(i.guild), view=self)
+
+    @discord.ui.button(label="รีเฟรช", emoji="🔄", style=discord.ButtonStyle.secondary)
+    async def refresh(self, i, b):
+        await i.response.edit_message(embed=self.cog.roleguard_embed(i.guild), view=self)
+
+
 class HubView(OwnerView):
     """/protect = ศูนย์รวม: เปิดเมนูแต่ละระบบ + ห้อง log + ไวท์ลิสต์ + Lockdown"""
 
@@ -300,6 +350,11 @@ class HubView(OwnerView):
                            0xE74C3C if c["lockdown"] else 0x2ECC71)
         await i.response.edit_message(embed=self.cog.hub_embed(), view=self)
 
+    @discord.ui.button(label="Role Guard", emoji="🎭", style=discord.ButtonStyle.secondary)
+    async def b_role(self, i, b):
+        await i.response.send_message(embed=self.cog.roleguard_embed(i.guild),
+                                      view=RoleGuardView(self.cog), ephemeral=True)
+
     @discord.ui.button(label="รีเฟรช", emoji="🔄", style=discord.ButtonStyle.secondary)
     async def b_ref(self, i, b):
         await i.response.edit_message(embed=self.cog.hub_embed(), view=self)
@@ -318,6 +373,7 @@ class Protect(commands.Cog):
         self.dupes = defaultdict(deque)
         self.cool = {}
         self.app_owner = None
+        self.rg_locks = defaultdict(asyncio.Lock)  # กัน Role Guard ทำซ้อนกับคนเดียวกัน
 
     async def cog_load(self):
         try:
@@ -380,6 +436,7 @@ class Protect(commands.Cog):
             lv = c[mod]["level"]
             e.add_field(name=f"{M['emoji']} {M['name']}", value=f"{LABEL[lv]}\n/{M['cmd']}")
         e.add_field(name="🔒 Lockdown", value=onoff(c["lockdown"]))
+        e.add_field(name="🎭 Role Guard", value=f"{onoff(c['roleguard']['enabled'])}\n/antirole")
         lc = c["log_channel"]
         e.add_field(name="📋 ห้อง log", value=f"<#{lc}>" if lc else "ยังไม่ตั้ง", inline=False)
         wr = "\n".join(f"<@&{r}>" for r in c["whitelist_roles"]) or "-"
@@ -430,6 +487,116 @@ class Protect(commands.Cog):
     @app_commands.guild_only()
     async def antibot(self, i: discord.Interaction):
         await self._open_level(i, "bots")
+
+    # ── Role Guard: ใครใส่ยศให้คนอื่น (ที่ไม่อยู่ไวลิสแยก) → ถอดทุกยศของคนที่ได้รับ ยกเว้นเมมเบอร์ ──
+    def keep_roles(self, guild):
+        """ยศเมมเบอร์ที่เก็บไว้: ที่เลือกไว้ ถ้ายังไม่เลือกจะหาจากชื่อ (Member / เมมเบอร์ / สมาชิก)"""
+        ids = set(self.cfg["roleguard"]["keep_roles"])
+        if ids:
+            return [r for r in guild.roles if r.id in ids]
+        return [r for r in guild.roles if not r.is_default() and _norm(r.name) in MEMBER_KEYS]
+
+    def roleguard_embed(self, guild):
+        rg = self.cfg["roleguard"]
+        e = discord.Embed(
+            title="🎭 Role Guard System",
+            description="ใครใส่ยศให้คนอื่น (ยศที่ **ไม่อยู่ในไวลิสแยก**) → บอทถอด **ทุกยศ** ของคนที่ได้รับ "
+                        "ยกเว้นเมมเบอร์ + แจ้งใน log\n"
+                        "ผู้ใส่ที่ถูกยกเว้น: เจ้าเซิร์ฟ / เจ้าของบอท / บอทตัวเอง / บอทอื่น "
+                        "(ไวท์ลิสต์ปกติ **ไม่** ถูกยกเว้น)",
+            color=0x5865F2)
+        e.add_field(name="สถานะ", value=onoff(rg["enabled"]))
+        allow = "\n".join(f"<@&{r}>" for r in rg["allow_roles"]) or "- (ยังไม่มี: ทุกยศที่มีคนใส่ให้จะโดนถอด)"
+        e.add_field(name="✅ ไวลิสแยก (ใส่ให้คนอื่นได้)", value=allow[:900], inline=False)
+        keep = self.keep_roles(guild)
+        if rg["keep_roles"]:
+            txt = " ".join(r.mention for r in keep) or "⚠️ ไม่พบยศที่เลือกไว้"
+        elif keep:
+            txt = " ".join(r.mention for r in keep) + "\n(ตรวจจากชื่ออัตโนมัติ)"
+        else:
+            txt = "⚠️ ไม่พบยศเมมเบอร์ — เลือกด้านล่าง ไม่งั้นจะถอดทุกยศหมด"
+        e.add_field(name="👤 ยศเมมเบอร์ที่เก็บไว้", value=txt[:900], inline=False)
+        lc = self.cfg["log_channel"]
+        e.add_field(name="📋 ห้อง log", value=f"<#{lc}>" if lc else "ยังไม่ตั้ง (ตั้งที่ /protect)", inline=False)
+        e.set_footer(text="ยศไวลิสแยก / ยศบอท (managed) / ยศที่สูงกว่าบอท จะไม่ถูกถอด")
+        return e
+
+    @commands.Cog.listener("on_audit_log_entry_create")
+    async def roleguard_entry(self, entry: discord.AuditLogEntry):
+        if entry.action != A.member_role_update:
+            return
+        rg = self.cfg["roleguard"]
+        if not rg["enabled"]:
+            return
+        guild, u = entry.guild, entry.user
+        if u is None or getattr(u, "bot", False):
+            return
+        if u.id in (getattr(self.bot.user, "id", None), guild.owner_id, self.app_owner):
+            return
+        if entry.target is None:
+            return
+        allow = set(rg["allow_roles"])
+        added = []
+        for r in getattr(entry.after, "roles", None) or []:
+            role = guild.get_role(r.id)
+            if role is not None and not role.managed and role.id not in allow:
+                added.append(role)
+        if not added:
+            return
+        member = guild.get_member(entry.target.id)
+        if member is None or member.id in (guild.owner_id, getattr(self.bot.user, "id", None)):
+            return
+        async with self.rg_locks[member.id]:
+            await self.roleguard_strip(guild, u, member, added)
+
+    async def roleguard_strip(self, guild, executor, member, added):
+        rg = self.cfg["roleguard"]
+        keep_ids = {r.id for r in self.keep_roles(guild)} | set(rg["allow_roles"])
+        me_top = guild.me.top_role
+        keep, removed, stuck = [], [], []
+        for r in member.roles:
+            if r.is_default() or r.managed or r.id in keep_ids:
+                keep.append(r)
+            elif r >= me_top:          # ยศสูงกว่าบอท ถอดไม่ได้
+                keep.append(r)
+                stuck.append(r)
+            else:
+                removed.append(r)
+        for r in added:                # ยศที่เพิ่งใส่ แต่ cache ยังไม่อัปเดต
+            if r not in removed and r not in keep and r < me_top:
+                removed.append(r)
+        if not removed and not stuck:
+            return
+
+        ok = True
+        if removed:
+            try:
+                await member.edit(roles=keep, reason=f"Role Guard: {executor} ใส่ยศให้ {member} (ไม่อยู่ในไวลิสแยก)")
+            except discord.HTTPException:
+                ok = False
+
+        lines = [
+            f"ผู้ใส่ยศ: {executor.mention} (`{executor.id}`)",
+            f"ผู้ได้รับ: {member.mention} (`{member.id}`)",
+            f"ยศที่ถูกใส่: {' '.join(r.mention for r in added)}",
+        ]
+        if removed and ok:
+            lines.append(f"✅ ถอดแล้ว {len(removed)} ยศ: " + " ".join(r.mention for r in removed)[:900])
+            kept = [r for r in keep if not r.is_default()]
+            if kept:
+                lines.append("เก็บไว้: " + " ".join(r.mention for r in kept)[:500])
+        if removed and not ok:
+            lines.append("❌ ถอดไม่สำเร็จ: บอทต้องมีสิทธิ์ Manage Roles และยศบอทต้องสูงกว่าเป้าหมาย")
+        if stuck:
+            lines.append("⚠️ ถอดไม่ได้ (ยศสูงกว่าบอท): " + " ".join(r.mention for r in stuck)[:500])
+        await self.log(guild, "🎭 Role Guard", "\n".join(lines), 0xE67E22 if ok else 0xE74C3C)
+
+    @app_commands.command(name="antirole", description="ตั้งค่าระบบป้องกันยศ (เจ้าของเท่านั้น)")
+    @app_commands.guild_only()
+    async def antirole(self, i: discord.Interaction):
+        if await self._owner_only(i):
+            await i.response.send_message(embed=self.roleguard_embed(i.guild),
+                                          view=RoleGuardView(self), ephemeral=True)
 
     # ── Anti-Link ──
     def link_violation(self, content):
