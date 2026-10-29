@@ -23,8 +23,9 @@ DEFAULT = {
     "bots": {"level": "medium"},
     "links": {"level": "medium", "allow": ["tenor.com", "giphy.com"]},
     # Role Guard: ไวลิสแยกจากไวท์ลิสต์ปกติ
-    #   allow_roles = ยศที่ใส่ให้คนอื่นได้ (บอทไม่ถอด) / keep_roles = ยศเมมเบอร์ที่เก็บไว้ตอนถอดทุกยศ
-    "roleguard": {"enabled": True, "allow_roles": [], "keep_roles": []},
+    #   giver_roles = ยศที่มีอำนาจใส่ยศให้คนอื่น (คนมียศนี้ใส่แล้วบอทไม่ถอด)
+    #   keep_roles  = ยศเมมเบอร์ที่เก็บไว้ตอนถอดทุกยศ
+    "roleguard": {"enabled": True, "giver_roles": [], "keep_roles": []},
 }
 
 A = discord.AuditLogAction
@@ -252,16 +253,16 @@ class LevelView(OwnerView):
 
 
 class RoleGuardView(OwnerView):
-    """/antirole = ตั้งไวลิสแยก (ยศที่ใส่ให้คนอื่นได้) + ยศเมมเบอร์ที่เก็บไว้"""
+    """/antirole = ตั้งไวลิสแยก (ยศที่มีอำนาจใส่ยศ) + ยศเมมเบอร์ที่เก็บไว้"""
 
     @discord.ui.select(cls=discord.ui.RoleSelect, min_values=1, max_values=25,
-                       placeholder="✅ ไวลิสแยก: ยศที่ใส่ให้คนอื่นได้ (เลือกซ้ำ = ลบออก)")
-    async def allow_roles(self, i: discord.Interaction, s: discord.ui.RoleSelect):
+                       placeholder="👑 เลือกยศที่ \"มีอำนาจ\" ใส่ยศให้คนอื่น (เลือกซ้ำ = ลบ)")
+    async def giver_roles(self, i: discord.Interaction, s: discord.ui.RoleSelect):
         rg = self.cog.cfg["roleguard"]
-        cur = set(rg["allow_roles"])
+        cur = set(rg["giver_roles"])
         for r in s.values:
             cur ^= {r.id}
-        rg["allow_roles"] = list(cur)
+        rg["giver_roles"] = list(cur)
         save(self.cog.cfg)
         await i.response.edit_message(embed=self.cog.roleguard_embed(i.guild), view=self)
 
@@ -500,14 +501,14 @@ class Protect(commands.Cog):
         rg = self.cfg["roleguard"]
         e = discord.Embed(
             title="🎭 Role Guard System",
-            description="ใครใส่ยศให้คนอื่น (ยศที่ **ไม่อยู่ในไวลิสแยก**) → บอทถอด **ทุกยศ** ของคนที่ได้รับ "
+            description="ใครใส่ยศให้คนอื่น โดยที่ **ไม่มียศในไวลิสแยก** → บอทถอด **ทุกยศ** ของคนที่ได้รับ "
                         "ยกเว้นเมมเบอร์ + แจ้งใน log\n"
-                        "ผู้ใส่ที่ถูกยกเว้น: เจ้าเซิร์ฟ / เจ้าของบอท / บอทตัวเอง / บอทอื่น "
+                        "ผู้ใส่ที่ไม่โดน: คนมียศในไวลิสแยก / เจ้าเซิร์ฟ / เจ้าของบอท / บอทตัวเอง / บอทอื่น "
                         "(ไวท์ลิสต์ปกติ **ไม่** ถูกยกเว้น)",
             color=0x5865F2)
         e.add_field(name="สถานะ", value=onoff(rg["enabled"]))
-        allow = "\n".join(f"<@&{r}>" for r in rg["allow_roles"]) or "- (ยังไม่มี: ทุกยศที่มีคนใส่ให้จะโดนถอด)"
-        e.add_field(name="✅ ไวลิสแยก (ใส่ให้คนอื่นได้)", value=allow[:900], inline=False)
+        giver = "\n".join(f"<@&{r}>" for r in rg["giver_roles"]) or "- (ยังไม่มี: ใครใส่ยศให้คนอื่นก็โดนถอดหมด ยกเว้นเจ้าเซิร์ฟ/บอท)"
+        e.add_field(name="👑 ยศที่มีอำนาจใส่ยศ (ไวลิสแยก) — คนมียศเหล่านี้ใส่ยศให้ใครก็ได้", value=giver[:900], inline=False)
         keep = self.keep_roles(guild)
         if rg["keep_roles"]:
             txt = " ".join(r.mention for r in keep) or "⚠️ ไม่พบยศที่เลือกไว้"
@@ -518,7 +519,7 @@ class Protect(commands.Cog):
         e.add_field(name="👤 ยศเมมเบอร์ที่เก็บไว้", value=txt[:900], inline=False)
         lc = self.cfg["log_channel"]
         e.add_field(name="📋 ห้อง log", value=f"<#{lc}>" if lc else "ยังไม่ตั้ง (ตั้งที่ /protect)", inline=False)
-        e.set_footer(text="ยศไวลิสแยก / ยศบอท (managed) / ยศที่สูงกว่าบอท จะไม่ถูกถอด")
+        e.set_footer(text="Role Guard v3 • ยศเมมเบอร์ / ยศบอท (managed) / ยศที่สูงกว่าบอท จะไม่ถูกถอด")
         return e
 
     @commands.Cog.listener("on_audit_log_entry_create")
@@ -535,11 +536,14 @@ class Protect(commands.Cog):
             return
         if entry.target is None:
             return
-        allow = set(rg["allow_roles"])
+        giver = set(rg["giver_roles"])
+        exec_member = guild.get_member(u.id)
+        if exec_member is not None and any(r.id in giver for r in exec_member.roles):
+            return  # ผู้ใส่มียศในไวลิสแยก = มีอำนาจใส่ยศ ไม่โดนบอท
         added = []
         for r in getattr(entry.after, "roles", None) or []:
             role = guild.get_role(r.id)
-            if role is not None and not role.managed and role.id not in allow:
+            if role is not None and not role.managed:
                 added.append(role)
         if not added:
             return
@@ -551,7 +555,7 @@ class Protect(commands.Cog):
 
     async def roleguard_strip(self, guild, executor, member, added):
         rg = self.cfg["roleguard"]
-        keep_ids = {r.id for r in self.keep_roles(guild)} | set(rg["allow_roles"])
+        keep_ids = {r.id for r in self.keep_roles(guild)}
         me_top = guild.me.top_role
         keep, removed, stuck = [], [], []
         for r in member.roles:
@@ -571,7 +575,7 @@ class Protect(commands.Cog):
         ok = True
         if removed:
             try:
-                await member.edit(roles=keep, reason=f"Role Guard: {executor} ใส่ยศให้ {member} (ไม่อยู่ในไวลิสแยก)")
+                await member.edit(roles=keep, reason=f"Role Guard: {executor} ใส่ยศให้ {member} (ผู้ใส่ไม่มียศในไวลิสแยก)")
             except discord.HTTPException:
                 ok = False
 
